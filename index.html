@@ -1161,6 +1161,11 @@ function drawMobileBlock() {
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, VW, VH);
 
+  // scale the panel up 1.5x around its own center — it reads too small at actual mobile viewport sizes
+  ctx.translate(CX, PLAY_MID);
+  ctx.scale(1.5, 1.5);
+  ctx.translate(-CX, -PLAY_MID);
+
   const boxW = 560, boxH = 320;
   const bx = CX - boxW / 2, by = PLAY_MID - boxH / 2;
   ctx.fillStyle = '#000';
