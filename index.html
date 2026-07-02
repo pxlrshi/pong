@@ -1,0 +1,1361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <title>PONG</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='black'/%3E%3Crect x='4' y='9' width='3' height='14' fill='white'/%3E%3Crect x='25' y='9' width='3' height='14' fill='white'/%3E%3Crect x='14.5' y='14.5' width='3' height='3' fill='white'/%3E%3C/svg%3E" />
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; background: #000; overflow: hidden; }
+    canvas {
+      display: block;
+      position: absolute;
+      top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      image-rendering: pixelated;
+    }
+  </style>
+</head>
+<body>
+<!-- chromatic aberration: split R/B channels horizontally, recombine additively -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <filter id="chromatic" x="-3%" y="-3%" width="106%" height="106%" color-interpolation-filters="sRGB">
+      <feColorMatrix in="SourceGraphic" type="matrix" result="red"
+        values="1 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 1 0"/>
+      <feOffset in="red" dx="-2.5" dy="0" result="redShift"/>
+      <feColorMatrix in="SourceGraphic" type="matrix" result="green"
+        values="0 0 0 0 0  0 1 0 0 0  0 0 0 0 0  0 0 0 1 0"/>
+      <feColorMatrix in="SourceGraphic" type="matrix" result="blue"
+        values="0 0 0 0 0  0 0 0 0 0  0 0 1 0 0  0 0 0 1 0"/>
+      <feOffset in="blue" dx="2.5" dy="0" result="blueShift"/>
+      <feBlend in="redShift" in2="green" mode="screen" result="rg"/>
+      <feBlend in="rg" in2="blueShift" mode="screen"/>
+    </filter>
+  </defs>
+</svg>
+<canvas id="c"></canvas>
+<script>
+const view = document.getElementById('c');   // visible canvas (CRT post-process target)
+
+/* ─── virtual canvas ──────────────────────────────────────────── */
+const VW = 1440, VH = 1024;
+let scale = 1;
+
+/* CRT post-process: the game is drawn to an offscreen 2D canvas, then a WebGL
+   pass warps it (barrel/fisheye), adds scanlines, and applies chromatic aberration.
+   If WebGL is unavailable, the game draws straight to `view` with the CSS CA filter. */
+let glProg, glTex, glURes, glURoll, glUFlicker;   // declared before initGL() runs (avoids TDZ on assignment)
+const ROLL_PERIOD = 6;       // seconds for the hum bar to travel the screen once
+const FLICKER_AMOUNT = 0.06; // max per-frame brightness dip (CRT flicker)
+const gl = initGL(view);
+const canvas = gl ? document.createElement('canvas') : view;   // 2D draw surface
+const ctx = canvas.getContext('2d');
+if (!gl) view.style.filter = 'url(#chromatic)';
+
+function resize() {
+  scale = Math.min(window.innerWidth / VW, window.innerHeight / VH);
+  canvas.width  = Math.round(VW * scale);
+  canvas.height = Math.round(VH * scale);
+  if (gl) { view.width = canvas.width; view.height = canvas.height; }
+}
+window.addEventListener('resize', resize);
+resize();
+
+/* desktop-only experience: block touch-primary / mobile-UA devices with a static notice */
+const isMobile = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
+  || (matchMedia('(pointer: coarse)').matches && matchMedia('(hover: none)').matches);
+
+/* ─── layout constants ────────────────────────────────────────── */
+const LX = 141;   // left boundary line
+const CX = 720;   // center line
+const RX = 1299;  // right boundary line
+const LP_X = 128; // left paddle left edge
+const RP_X = 1300;// right paddle left edge
+const PW = 12, PH = 160, BS = 16;
+const PLAY_TOP = 152, PLAY_BOTTOM = 872;  // court band (lines span this; ball/paddles stay inside)
+const PLAY_MID = (PLAY_TOP + PLAY_BOTTOM) / 2;
+const PSPEED = 9;
+const BASE_SPEED = 10, MAX_SPEED = 19;
+const HITSTOP = 4;   // frames the sim freezes on a paddle hit (impact feel)
+const MAX_BOUNCE = 62 * Math.PI / 180;  // cap bounce angle from horizontal so the ball never stalls vertically
+const PADDLE_RECOIL = 10;   // px the paddle (and its score) gets knocked outward on impact
+const BALL_SQUASH = 0.45;         // ball compression on impact (fraction of size)
+const BALL_SQUASH_DECAY = 0.35;   // per-frame spring back toward round — fast, so the motion stretch shows through almost immediately
+const BALL_STRETCH = 0.34;        // max motion stretch along the ball's dominant travel axis
+const SCORE_LAG = 0.35;     // how fast the score catches up to its paddle (lower = more lag)
+/* solo-mode AI: speed cap (fraction of PSPEED), aim error (px, re-rolled each approach),
+   accel (velocity easing), reaction (px from the paddle plane before it starts tracking —
+   wall bounces no longer give it unlimited time to correct, since it ignores the ball until then) */
+const AI_DIFFICULTY = {
+  easy:   { speed: 0.66, error: 46, accel: 0.11, reaction: 280 },
+  medium: { speed: 0.78, error: 28, accel: 0.15, reaction: 380 },
+  hard:   { speed: 0.92, error: 14, accel: 0.22, reaction: 460 },
+};
+const SCORE_TARGET = 1100;  // denominator shown under each score
+const WIN_SCORE = SCORE_TARGET / 100;  // points needed to win (each point = 100 shown)
+/* shared chrome styling */
+const DIM = 'rgba(255,255,255,0.28)';        // dim header/footer text, chevrons, title
+const KEYCAP_BG = 'rgba(255,255,255,0.18)';  // keycap background box
+const KEYCAP_FG = 'rgba(255,255,255,0.80)';  // keycap letter
+const HDR_R1 = 58, HDR_R2 = 100;             // two stacked header rows
+const CENTER_LH = 44;                        // line height of the center-line status label
+/* cinematic "bullet time" on a near hit / near miss */
+const CINE_ENABLED = false;
+const CINE_ZOOM = 1.6;        // camera zoom factor during the close call
+const CINE_SLOW = 0.32;       // sim time-scale during slowmo (1 = normal)
+const CINE_APPROACH = 200;    // px from the paddle plane to start watching
+const CINE_NEAR_BAND = 12;    // px from a paddle edge that counts as a "near" call
+const CINE_NEAR_FRAMES = 6;   // consecutive frames the call must stay near to trigger (filters paddle-sweep transients)
+/* score flash: invert the whole screen back and forth a couple times */
+const FLASH_FRAMES = 32;      // total frames the flash runs (4 inversions)
+const FLASH_HALF = 4;         // frames per invert/normal phase
+const PLUS100_FRAMES = 32;    // of the strobe's frames, how many show the +100 (all of them)
+const SERVE_DELAY = 60;       // pause after the strobe before the countdown
+/* paddle hit pitch: starts low, climbs as the rally goes on (resets each serve) */
+const HIT_FREQ_BASE = 300;    // pitch of the first hit in a rally
+const HIT_FREQ_RISE = 1.06;   // pitch multiplier per subsequent hit (~1 semitone)
+const HIT_FREQ_MAX = 1200;    // ceiling so long rallies don't shriek
+
+/* ─── audio ───────────────────────────────────────────────────── */
+let ac;
+function audio() { if (!ac) ac = new (window.AudioContext || window.webkitAudioContext)(); return ac; }
+function beep(freq, dur, vol = 0.4, type = 'square') {
+  try {
+    const a = audio();
+    const o = a.createOscillator(), g = a.createGain();
+    o.connect(g); g.connect(a.destination);
+    o.type = type; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur);
+    o.start(); o.stop(a.currentTime + dur + 0.02);
+  } catch (_) {}
+}
+function scoreSound() {
+  if (screen !== 'game') return;   // silent during the menu demo
+  // triumphant chord hit
+  [120, 180, 240].forEach((f, i) => beep(f, 0.6, 0.35, 'sawtooth'));
+}
+function paddleHitSound() {
+  if (screen !== 'game') return;   // silent during the menu demo
+  // pitch rises with each hit of the current rally
+  const freq = Math.min(HIT_FREQ_MAX, HIT_FREQ_BASE * Math.pow(HIT_FREQ_RISE, S.rallyHits));
+  S.rallyHits++;
+  beep(freq, 0.07, 0.55, 'square');
+}
+function winSound() {
+  if (screen !== 'game') return;
+  // ascending C-E-G-C fanfare
+  [262, 330, 392, 523].forEach((f, i) => setTimeout(() => beep(f, 0.18, 0.4, 'square'), i * 90));
+}
+
+/* ─── state ───────────────────────────────────────────────────── */
+let S;
+function mkState() {
+  return {
+    left:  { y: PLAY_MID - PH/2, vy: 0, score: 0, stretchY: 1, squishT: 0, recoil: 0, scoreY: PLAY_MID, aiSign: 0, aiErrorY: 0, aiTargetY: PLAY_MID },
+    right: { y: PLAY_MID - PH/2, vy: 0, score: 0, stretchY: 1, squishT: 0, recoil: 0, scoreY: PLAY_MID, aiSign: 0, aiErrorY: 0, aiTargetY: PLAY_MID },
+    ball:  { x: VW/2, y: PLAY_MID, vx: 0, vy: 0, squish: 0, squishAxis: 'x' },
+    shake: { x: 0, y: 0, dur: 0, maxDur: 0, intensity: 0 },
+    hitstop: 0,
+    cine: { active: false, cooldown: 0, nearStreak: 0, zoom: 1, timeScale: 1,
+            fx: VW/2, fy: PLAY_MID, tx: VW/2, ty: PLAY_MID },
+    flash: 0,
+    flashSide: 'left',   // which side just scored (drives the +100 popup)
+    rallyHits: 0,
+    winner: null,   // 'left' | 'right' once someone reaches WIN_SCORE
+    streak: 0,      // practice: consecutive paddle hits
+    leftAI: false, rightAI: false,   // AI control (used for the menu demo)
+    paused: false,
+    serveT: 90,   // countdown frames before serve (3 stages: 5 → 3 → 1)
+    serveDelay: SERVE_DELAY,   // brief pause before the countdown starts
+    serving: true,
+  };
+}
+
+function serveBall(direction) {
+  // direction: 'left' = ball goes left, 'right' = ball goes right
+  const dir = direction === 'left' ? -1 : 1;
+  const angle = (Math.random() * 50 - 25) * Math.PI / 180;
+  const spd = BASE_SPEED;
+  S.ball = {
+    x: VW/2, y: PLAY_MID,
+    vx: Math.cos(angle) * spd * dir,
+    vy: Math.sin(angle) * spd,
+    squish: 0, squishAxis: 'x'
+  };
+  S.serving = true;
+  S.serveT = 90;
+  S.serveDelay = SERVE_DELAY;
+  S.rallyHits = 0;
+  S.cine.active = false;
+  S.cine.cooldown = 0;
+  S.cine.nearStreak = 0;
+}
+
+function winGame(side) {
+  S.winner = side;
+  S.serving = false;
+  S.ball.x = VW/2; S.ball.y = PLAY_MID; S.ball.vx = 0; S.ball.vy = 0;
+  addShake(26, 30);   // celebratory jolt
+  winSound();
+}
+
+/* tennis-style scoring state: dynamic win target + a label for the center line.
+   target/label are in point units (display = ×100). T = WIN_SCORE, deuce at T-1 each. */
+function gameStatus() {
+  const L = S.left.score, R = S.right.score, T = WIN_SCORE;
+  if (L >= T - 1 && R >= T - 1) {           // deuce zone — both within one of the target
+    if (L === R) return { target: L + 2, label: 'deuce' };
+    return { target: Math.max(L, R) + 1, label: L > R ? 'adv-left' : 'adv-right' };
+  }
+  // not in deuce zone: target is the base, leader at T-1 is at game point
+  if (L === T - 1 && L > R) return { target: T, label: 'gp-left' };
+  if (R === T - 1 && R > L) return { target: T, label: 'gp-right' };
+  return { target: T, label: 'normal' };
+}
+
+function addShake(intensity, dur) {
+  S.shake.intensity = intensity;
+  S.shake.dur = S.shake.maxDur = dur;
+}
+
+/* ─── screens / main menu ──────────────────────────────────────── */
+let screen = 'menu';        // 'menu' | 'game'
+let menuIndex = 0;
+let menuSelY = null;        // eased y of the selector bullet (for smooth movement)
+let menuExiting = false, menuEntering = false, menuExit = 0, pendingMode = null;  // menu → game exit / sub-menu transition
+let menuStage = 'mode';      // 'mode' | 'difficulty' (solo play's intermediary difficulty select)
+let pendingAdvance = false, pendingBack = false;   // which transition the current menuExit run completes into
+let diffIndex = 1;           // 0=easy, 1=medium, 2=hard
+let aiDifficulty = 'medium';
+let pauseAnim = 0;          // pause-menu presence (0 hidden … 1 shown)
+let pauseExiting = false;   // pause menu is animating out (continue)
+let winAnim = 0;            // win-screen presence (0 hidden … 1 shown)
+let quitting = false, quitT = 0, quitSwitched = false;      // game → menu fade-through-black
+let modeEnter = 1, modeEntering = false;   // mode-specific entrance transition (0 = mid-transition, 1 = settled)
+let currentMode = 'versus';
+function loadHigh() { try { return +localStorage.getItem('pong.practiceHigh') || 0; } catch (_) { return 0; } }
+function saveHigh() { try { localStorage.setItem('pong.practiceHigh', practiceHigh); } catch (_) {} }
+let practiceHigh = loadHigh();   // best hit streak in practice mode (persisted)
+const MODES = [
+  { key: 'solo',     title: 'SOLO PLAY', desc: ['TAKE ON THE COMPUTER.'] },
+  { key: 'versus',   title: 'VERSUS',    desc: ['FACE OFF AGAINST A FRIEND.'] },
+  { key: 'practice', title: 'PRACTICE',  desc: ['HONE YOUR SKILLS AGAINST', 'THE WALL.'] },
+];
+const DIFFICULTIES = [
+  { key: 'easy',   title: 'EASY',   desc: ['A GENTLE OPPONENT.'] },
+  { key: 'medium', title: 'MEDIUM', desc: ['A FAIR FIGHT.'] },
+  { key: 'hard',   title: 'HARD',   desc: ['A RUTHLESS OPPONENT.'] },
+];
+function startGame(mode) {
+  currentMode = mode; init(); screen = 'game';
+  modeEnter = 0; modeEntering = true;   // HUD builds in from the menu's placeholder paddles
+}
+function quitToMenu() {
+  screen = 'menu'; menuIndex = 0; menuSelY = null; menuStage = 'mode';
+  menuExiting = false; menuEntering = false; menuExit = 0; pendingAdvance = false; pendingBack = false;
+  pauseExiting = false; pauseAnim = 0; init();
+}
+
+/* ─── input ───────────────────────────────────────────────────── */
+const keys = {};
+document.addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (screen === 'menu') {
+    if (menuExiting || menuEntering) { e.preventDefault(); return; }   // ignore input mid-transition
+    const difficulty = menuStage === 'difficulty';
+    const listLen = difficulty ? DIFFICULTIES.length : MODES.length;
+    if (k === 'w' || k === 'arrowup') {
+      if (difficulty) diffIndex = Math.max(0, diffIndex - 1); else menuIndex = Math.max(0, menuIndex - 1);
+      beep(420, 0.04, 0.2, 'square');
+    } else if (k === 's' || k === 'arrowdown') {
+      if (difficulty) diffIndex = Math.min(listLen - 1, diffIndex + 1); else menuIndex = Math.min(listLen - 1, menuIndex + 1);
+      beep(420, 0.04, 0.2, 'square');
+    } else if (k === 'enter') {
+      beep(660, 0.08, 0.3, 'square');
+      if (difficulty) { aiDifficulty = DIFFICULTIES[diffIndex].key; pendingMode = 'solo'; pendingAdvance = false; }
+      else { pendingMode = MODES[menuIndex].key; pendingAdvance = pendingMode === 'solo'; }
+      menuExiting = true; menuExit = 0;
+    } else if ((k === 'q' || k === 'backspace') && difficulty) {
+      beep(300, 0.05, 0.2, 'square');
+      pendingBack = true; menuExiting = true; menuExit = 0;   // back to mode select
+    }
+    e.preventDefault();
+    return;
+  }
+  if (quitting) { e.preventDefault(); return; }      // ignore input during the quit fade
+  keys[k] = true;
+  if (e.key === ' ' || k === 'p') {                  // toggle pause (fades in / out)
+    if (!S.paused) { S.paused = true; pauseExiting = false; }
+    else if (!pauseExiting) pauseExiting = true;     // resume: fade the menu out
+  }
+  if (k === 'r') init();                             // restart / replay
+  if (S.paused && !pauseExiting) {
+    if (k === 'c') pauseExiting = true;              // continue: fade the menu out
+    if (k === 'q') { quitting = true; quitT = 0; quitSwitched = false; }  // quit: fade through black
+  }
+  if (S.winner && k === 'q') { quitting = true; quitT = 0; quitSwitched = false; }  // win screen: quit to menu
+  e.preventDefault();
+});
+document.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+
+/* ─── init ────────────────────────────────────────────────────── */
+function init() {
+  S = mkState();
+  S.rightAI = currentMode === 'solo';
+  serveBall(currentMode === 'practice' ? 'left' : (Math.random() < 0.5 ? 'left' : 'right'));
+}
+
+/* ─── update ──────────────────────────────────────────────────── */
+function update() {
+  if (S.paused) return;
+  if (S.flash > 0) S.flash--;
+  if (S.winner) { updateShake(); return; }   // game over — freeze, let shake/flash settle
+
+  const { left, right, ball: b } = S;
+
+  /* serve countdown */
+  if (S.serving) {
+    if (S.flash <= 0) {            // wait for the score strobe to finish first
+      if (S.serveDelay > 0) {
+        S.serveDelay--;            // then a brief pause before the countdown
+      } else {
+        S.serveT--;
+        if (S.serveT <= 0) S.serving = false;
+      }
+    }
+
+    // Still let paddles move during serve countdown; ease the camera back to normal
+    S.cine.active = false;
+    updateCineEase();
+    movePaddles();
+    return;
+  }
+
+  /* hitstop — freeze the ball/paddles for a few frames on impact,
+     but keep the screen shake rattling so the hit reads as punchy.
+     The cinematic zoom holds frozen here too, which makes the hit land harder. */
+  if (S.hitstop > 0) {
+    S.hitstop--;
+    updateShake();
+    return;
+  }
+
+  /* cinematic slowmo + zoom when a near hit/miss is imminent */
+  updateCine();
+  const ts = S.cine.timeScale;
+
+  movePaddles(ts);
+
+  /* paddle stretch (visual only) */
+  const targetSL = 1 + Math.abs(left.vy)  / PSPEED * 0.10;
+  const targetSR = 1 + Math.abs(right.vy) / PSPEED * 0.10;
+  left.stretchY  += (targetSL - left.stretchY)  * 0.25;
+  right.stretchY += (targetSR - right.stretchY) * 0.25;
+  if (left.squishT  > 0) left.squishT--;
+  if (right.squishT > 0) right.squishT--;
+  left.recoil  *= 0.8;   // spring the knocked-back paddle/score home
+  right.recoil *= 0.8;
+
+  /* ball squash springs back to round (held frozen through hitstop) */
+  if (b.squish > 0.001) b.squish *= BALL_SQUASH_DECAY; else b.squish = 0;
+
+  /* move ball (scaled by cinematic slowmo) */
+  b.x += b.vx * ts; b.y += b.vy * ts;
+
+  /* ball speed (drives bounce angle / speed-up) — ball size stays fixed */
+  const spd = Math.sqrt(b.vx*b.vx + b.vy*b.vy);
+
+  /* top/bottom walls (court band) */
+  if (b.y - BS/2 < PLAY_TOP) {
+    b.y = PLAY_TOP + BS/2; b.vy = Math.abs(b.vy);
+    beep(200, 0.07, 0.18, 'square');
+    b.squish = 1; b.squishAxis = 'y';
+  }
+  if (b.y + BS/2 > PLAY_BOTTOM) {
+    b.y = PLAY_BOTTOM - BS/2; b.vy = -Math.abs(b.vy);
+    beep(200, 0.07, 0.18, 'square');
+    b.squish = 1; b.squishAxis = 'y';
+  }
+
+  /* left paddle collision */
+  if (b.vx < 0 && b.x - BS/2 < LP_X + PW && b.x + BS/2 > LP_X) {
+    const cy = left.y + PH/2;
+    if (b.y > left.y - BS && b.y < left.y + PH + BS) {
+      b.x = LP_X + PW + BS/2;
+      const hit = (b.y - cy) / (PH / 2);            // -1..1
+      const newSpd = Math.min(spd * 1.06, MAX_SPEED);
+      let outAngle = hit * 55 * Math.PI / 180 + left.vy * 0.06;
+      outAngle = Math.max(-MAX_BOUNCE, Math.min(MAX_BOUNCE, outAngle));
+      b.vx =  Math.abs(Math.cos(outAngle) * newSpd);
+      b.vy =  Math.sin(outAngle) * newSpd;
+      paddleHitSound();
+      addShake(6, 8);
+      left.squishT = 8;
+      left.recoil = -PADDLE_RECOIL;
+      b.squish = 1; b.squishAxis = 'x';
+      S.hitstop = HITSTOP;
+      if (currentMode === 'practice') {     // count the hit; track the best streak
+        S.streak++;
+        if (S.streak > practiceHigh) { practiceHigh = S.streak; saveHigh(); }
+      }
+    }
+  }
+
+  if (currentMode === 'practice') {
+    /* right side is a solid wall — the ball just bounces back */
+    if (b.vx > 0 && b.x + BS/2 > RP_X) {
+      b.x = RP_X - BS/2; b.vx = -Math.abs(b.vx);
+      beep(200, 0.07, 0.18, 'square');
+      addShake(4, 6);
+      b.squish = 1; b.squishAxis = 'x';
+    }
+  } else {
+    /* right paddle collision */
+    if (b.vx > 0 && b.x + BS/2 > RP_X && b.x - BS/2 < RP_X + PW) {
+      const cy = right.y + PH/2;
+      if (b.y > right.y - BS && b.y < right.y + PH + BS) {
+        b.x = RP_X - BS/2;
+        const hit = (b.y - cy) / (PH / 2);
+        const newSpd = Math.min(spd * 1.06, MAX_SPEED);
+        let outAngle = hit * 55 * Math.PI / 180 + right.vy * 0.06;
+        outAngle = Math.max(-MAX_BOUNCE, Math.min(MAX_BOUNCE, outAngle));
+        b.vx = -Math.abs(Math.cos(outAngle) * newSpd);
+        b.vy =  Math.sin(outAngle) * newSpd;
+        paddleHitSound();
+        addShake(6, 8);
+        right.squishT = 8;
+        right.recoil = PADDLE_RECOIL;
+        b.squish = 1; b.squishAxis = 'x';
+        S.hitstop = HITSTOP;
+      }
+    }
+  }
+
+  if (currentMode === 'practice') {
+    /* miss — ball got past the player; strobe + sound, drop the streak, re-serve */
+    if (b.x + BS/2 < LX) {
+      S.streak = 0;
+      scoreSound();
+      S.flash = FLASH_FRAMES;
+      S.flashSide = 'left';
+      serveBall('left');
+    }
+  } else {
+    /* scoring — ball fully crosses a side boundary line (win by 2: deuce/advantage) */
+    if (b.x + BS/2 < LX) {
+      right.score++;
+      scoreSound();
+      S.flash = FLASH_FRAMES;
+      S.flashSide = 'right';
+      if (right.score >= WIN_SCORE && right.score - left.score >= 2) winGame('right'); else serveBall('right');
+    }
+    if (b.x - BS/2 > RX) {
+      left.score++;
+      scoreSound();
+      S.flash = FLASH_FRAMES;
+      S.flashSide = 'left';
+      if (left.score >= WIN_SCORE && left.score - right.score >= 2) winGame('left'); else serveBall('left');
+    }
+  }
+
+  updateShake();
+}
+
+function updateShake() {
+  if (S.shake.dur > 0) {
+    const t = S.shake.dur / S.shake.maxDur;
+    S.shake.x = (Math.random() - 0.5) * S.shake.intensity * t * 2;
+    S.shake.y = (Math.random() - 0.5) * S.shake.intensity * t * 2;
+    S.shake.dur--;
+  } else {
+    S.shake.x *= 0.75; S.shake.y *= 0.75;
+  }
+}
+
+function setPaddleVel(p, ai, upKey, downKey, aiSide) {
+  if (ai) {
+    const cfg = AI_DIFFICULTY[aiDifficulty];
+    const b = S.ball;
+    const approaching = aiSide < 0 ? b.vx < 0 : b.vx > 0;
+    let targetVy = 0;
+    if (approaching) {
+      if (p.aiSign !== 1) {   // ball just turned toward this paddle — roll a fresh (imperfect) read
+        p.aiSign = 1;
+        p.aiErrorY = (Math.random() * 2 - 1) * cfg.error;
+      }
+      const planeX = aiSide < 0 ? LP_X + PW : RP_X;
+      const distToPlane = aiSide < 0 ? (b.x - planeX) : (planeX - b.x);
+      // ignore the ball until it's within the reaction window — wall bounces no longer
+      // grant unlimited correction time, since only the final approach counts
+      if (distToPlane <= cfg.reaction) {
+        p.aiTargetY = predictYAtPlane(b.x, b.y, b.vx, b.vy, planeX) + p.aiErrorY;
+        const diff = p.aiTargetY - (p.y + PH/2);
+        if (diff < -6) targetVy = -PSPEED * cfg.speed;
+        else if (diff > 6) targetVy = PSPEED * cfg.speed;
+      }
+      // else: ball's still far off — hold ground, no need to commit to a read yet
+    } else {
+      p.aiSign = 0;
+      // ball's headed away — stay put at the last hit spot, like a human not rushing back to center
+    }
+    p.vy += (targetVy - p.vy) * cfg.accel;   // ease toward the target speed, same as a human releasing/pressing a key
+  } else {
+    if (keys[upKey]) p.vy = -PSPEED; else if (keys[downKey]) p.vy = PSPEED; else p.vy *= 0.78;
+  }
+}
+
+function movePaddles(ts = 1) {
+  const { left, right } = S;
+  setPaddleVel(left,  S.leftAI,  'w', 's', -1);
+  setPaddleVel(right, S.rightAI, 'i', 'k', 1);
+  left.y  = Math.max(PLAY_TOP, Math.min(PLAY_BOTTOM - PH, left.y  + left.vy  * ts));
+  right.y = Math.max(PLAY_TOP, Math.min(PLAY_BOTTOM - PH, right.y + right.vy * ts));
+  // score numbers trail behind their paddle's vertical movement
+  left.scoreY  += (left.y  + PH/2 - left.scoreY)  * SCORE_LAG;
+  right.scoreY += (right.y + PH/2 - right.scoreY) * SCORE_LAG;
+}
+
+/* ─── cinematic near hit/miss ──────────────────────────────────── */
+
+/* predict the ball's y where it reaches a given x-plane, folding wall bounces */
+function predictYAtPlane(x, y, vx, vy, planeX) {
+  const t = (planeX - x) / vx;
+  const yy = y + vy * t;
+  const h = PLAY_BOTTOM - PLAY_TOP;
+  let m = (((yy - PLAY_TOP) % (2 * h)) + 2 * h) % (2 * h);   // triangle-wave fold
+  if (m > h) m = 2 * h - m;
+  return PLAY_TOP + m;
+}
+
+/* info about the paddle the ball is heading toward, or null */
+function approach() {
+  const b = S.ball;
+  let paddle, planeX, dist;
+  if (b.vx < 0)      { paddle = S.left;  planeX = LP_X + PW; dist = b.x - planeX; }
+  else if (b.vx > 0) { paddle = S.right; planeX = RP_X;      dist = planeX - b.x; }
+  else return null;
+  const predY = predictYAtPlane(b.x, b.y, b.vx, b.vy, planeX);
+  const near = Math.abs(predY - paddle.y) <= CINE_NEAR_BAND ||
+               Math.abs(predY - (paddle.y + PH)) <= CINE_NEAR_BAND;
+  return { dist, near, fx: (b.x + planeX) / 2, fy: (b.y + predY) / 2 };
+}
+
+function updateCine() {
+  const c = S.cine;
+  if (!CINE_ENABLED) { c.active = false; updateCineEase(); return; }
+  const a = approach();
+  if (c.active) {
+    // stay locked through the close call until the ball passes the plane (resolved)
+    if (!a || a.dist < 0 || a.dist > CINE_APPROACH + 80) { c.active = false; c.cooldown = 24; c.nearStreak = 0; }
+    else { c.tx = a.fx; c.ty = a.fy; }
+  } else {
+    // count consecutive frames the call stays near an edge; only a sustained
+    // near-call (not a transient paddle sweep) builds enough streak to trigger
+    if (a && a.near && a.dist >= 0 && a.dist <= CINE_APPROACH) c.nearStreak++;
+    else c.nearStreak = 0;
+    if (c.nearStreak >= CINE_NEAR_FRAMES && c.cooldown <= 0) {
+      c.active = true; c.tx = a.fx; c.ty = a.fy;
+    }
+  }
+  if (c.cooldown > 0) c.cooldown--;
+  updateCineEase();
+}
+
+function updateCineEase() {
+  const c = S.cine;
+  const zT  = c.active ? CINE_ZOOM : 1;
+  const tsT = c.active ? CINE_SLOW : 1;
+  c.zoom      += (zT  - c.zoom)      * 0.10;
+  c.timeScale += (tsT - c.timeScale) * 0.16;
+  const fxT = c.active ? c.tx : VW/2;
+  const fyT = c.active ? c.ty : PLAY_MID;
+  c.fx += (fxT - c.fx) * 0.16;
+  c.fy += (fyT - c.fy) * 0.16;
+}
+
+/* ─── draw ────────────────────────────────────────────────────── */
+function draw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.save();
+  ctx.scale(scale, scale);
+
+  const { left, right, ball: b } = S;
+  const c = S.cine;
+  const practice = currentMode === 'practice';
+  const status = practice ? { label: 'normal' } : gameStatus();
+
+  /* mode-entrance transition: builds the practice HUD out of the menu's placeholder paddle */
+  if (modeEntering) {
+    modeEnter += (1 - modeEnter) * 0.12;
+    if (modeEnter > 0.995) { modeEnter = 1; modeEntering = false; }
+  }
+  const me = modeEnter;
+
+  /* background (fixed, full canvas) */
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, VW, VH);
+
+  /* ── WORLD: screen shake + cinematic zoom toward the focus point ── */
+  ctx.save();
+  ctx.translate(S.shake.x, S.shake.y);
+  ctx.translate(VW/2, VH/2);
+  ctx.scale(c.zoom, c.zoom);
+  ctx.translate(-c.fx, -c.fy);
+
+  /* boundary lines */
+  ctx.strokeStyle = 'rgba(255,255,255,0.14)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(LX, PLAY_TOP); ctx.lineTo(LX, PLAY_BOTTOM); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(RX, PLAY_TOP); ctx.lineTo(RX, PLAY_BOTTOM); ctx.stroke();
+  /* center line — broken to leave a gap for the deuce/adv/game-point label */
+  const labelRows = centerLabelRows(status.label);
+  if (labelRows) {
+    const gap = (labelRows.length - 1) * CENTER_LH / 2 + 28;
+    ctx.beginPath(); ctx.moveTo(CX, PLAY_TOP); ctx.lineTo(CX, PLAY_MID - gap); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(CX, PLAY_MID + gap); ctx.lineTo(CX, PLAY_BOTTOM); ctx.stroke();
+    drawVerticalRows(labelRows, CX, PLAY_MID, CENTER_LH);
+  } else {
+    ctx.beginPath(); ctx.moveTo(CX, PLAY_TOP); ctx.lineTo(CX, PLAY_BOTTOM); ctx.stroke();
+  }
+
+  /* ─ ball — hidden during the post-score strobe + pause; appears when the countdown starts ─ */
+  if (!(S.serving && (S.flash > 0 || S.serveDelay > 0))) {
+    // motion stretch: elongate along whichever axis dominates the current travel direction
+    // (skip during the serve countdown — the ball already has its serve velocity assigned,
+    // but sits still on screen until the countdown ends, so it should still read as round)
+    let bsx = 1, bsy = 1;
+    const speed = S.serving ? 0 : Math.hypot(b.vx, b.vy);
+    if (speed > 0.01) {
+      const dirRatio = (Math.abs(b.vx) - Math.abs(b.vy)) / speed;   // +1 = fully horizontal, -1 = fully vertical
+      const stretch = dirRatio * BALL_STRETCH * Math.min(1, speed / BASE_SPEED);
+      bsx = 1 + stretch; bsy = 1 - stretch * 0.7;
+    }
+    // squash on impact: compress along the contact axis, bulge the other way — layered on
+    // top of the motion stretch (not replacing it), so the ball is already showing the
+    // correct post-bounce stretch shape the instant the squash finishes decaying
+    if (b.squish > 0) {
+      const q = b.squish;
+      if (b.squishAxis === 'x') { bsx *= 1 - BALL_SQUASH * q; bsy *= 1 + BALL_SQUASH * q * 0.7; }
+      else                      { bsy *= 1 - BALL_SQUASH * q; bsx *= 1 + BALL_SQUASH * q * 0.7; }
+    }
+    drawBall(b.x, b.y, bsx, bsy, 1);
+  }
+
+  /* ─ paddles ─ (practice replaces the right paddle with a full-length wall) */
+  drawPaddle(left,  LP_X, 'left');
+  if (practice) {
+    // grows from the placeholder paddle's rect (as seen in the menu) into the full wall
+    const startTop = PLAY_MID - PH/2, startH = PH;
+    const wallTop = startTop + (PLAY_TOP - startTop) * me;
+    const wallH   = startH   + ((PLAY_BOTTOM - PLAY_TOP) - startH) * me;
+    ctx.save();
+    ctx.shadowColor = 'rgba(255,255,255,0.65)';
+    ctx.shadowBlur  = 12;
+    ctx.fillStyle   = '#fff';
+    ctx.fillRect(RP_X, wallTop, PW, wallH);
+    ctx.restore();
+  } else {
+    drawPaddle(right, RP_X, 'right');
+  }
+
+  /* ─ scores ─ */
+  if (practice) {
+    // hit streak over session high score — fades in and slides in from the left
+    ctx.save();
+    ctx.globalAlpha = me;
+    ctx.translate(-(1 - me) * 80, 0);
+    drawScore(S.streak, practiceHigh, LP_X - 20 + left.recoil, left.scoreY, 'left');
+    ctx.restore();
+  } else {
+    // score×100 over the dynamic win target, trailing each paddle
+    // each side fades in and slides in from its own outer edge
+    const denom = status.target * 100;
+    ctx.save();
+    ctx.globalAlpha = me;
+    ctx.translate(-(1 - me) * 80, 0);
+    drawScore(left.score * 100, denom, LP_X - 20 + left.recoil, left.scoreY, 'left');
+    drawScoreBar(LP_X + left.recoil, left.y, left.score / status.target, 'left');
+    ctx.restore();
+    ctx.save();
+    ctx.globalAlpha = me;
+    ctx.translate((1 - me) * 80, 0);
+    drawScore(right.score * 100, denom, RP_X + PW + 20 + right.recoil, right.scoreY, 'right');
+    drawScoreBar(RP_X + right.recoil, right.y, right.score / status.target, 'right');
+    ctx.restore();
+  }
+
+  /* ─ serve countdown — balls that fade out: 5 → 3 → 1 (after strobe + pause) ─ */
+  if (S.serving && S.serveT > 0 && S.flash <= 0 && S.serveDelay <= 0) {
+    const stage = Math.ceil(S.serveT / 30);   // 3, 2, 1
+    const count = stage * 2 - 1;               // 5, 3, 1
+    const within = ((S.serveT - 1) % 30) / 30; // 1 → 0 across each stage
+    const alpha = Math.min(1, within * 4) * 0.85; // fade out near each step
+    const gap = 36;
+    for (let d = 0; d < count; d++) {
+      const dx = VW/2 + (d - (count - 1) / 2) * gap;
+      drawBall(dx, VH/2, 1, 1, alpha);
+    }
+  }
+
+  ctx.restore();   // ── end WORLD camera ──
+
+  /* ── CHROME: fixed UI overlay (header, title, footer) — never zoomed ── */
+  ctx.fillStyle = DIM;
+  ctx.strokeStyle = DIM;
+
+  /* PONG logo — paddle bars framing P, ball(=O) / N, G */
+  drawTitleLogo(CX);
+
+  /* player controls: P1 = W↑ / S↓ , P2 = I↑ / K↓ (P2 hidden in practice, replaced by CPU in solo) */
+  /* settles down from above + fades in, alongside the growing wall (practice) or scores (versus/solo) */
+  const solo = currentMode === 'solo';
+  ctx.save();
+  ctx.globalAlpha = me; ctx.translate(0, (1 - me) * -40);
+  drawControlRow(LX, HDR_R1, 'P', 'W', 'up');
+  drawControlRow(LX, HDR_R2, '1', 'S', 'down');
+  if (solo) {
+    ctx.fillStyle = DIM;
+    ctx.font = 'bold italic 18px "Inter", monospace';
+    ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+    const cpuMidY = (HDR_R1 + HDR_R2) / 2, cpuLh = 34;
+    ['C', 'P', 'U'].forEach((ch, i) => ctx.fillText(ch, RX, cpuMidY + (i - 1) * cpuLh));
+  } else if (!practice) {
+    drawControlRow(RX, HDR_R1, 'P', 'I', 'up');
+    drawControlRow(RX, HDR_R2, '2', 'K', 'down');
+  }
+  ctx.restore();
+
+  /* bottom controls + corner captions — settle up from below + fade in */
+  ctx.save();
+  ctx.globalAlpha = me; ctx.translate(0, (1 - me) * 40);
+  drawFooterRow('P', 'A U S E',     VW/2, 936);
+  drawFooterRow('R', 'E S T A R T', VW/2, 976);
+
+  ctx.fillStyle = DIM;
+  ctx.font = 'bold italic 20px "Inter", monospace';
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'left';
+  ctx.fillText(currentMode === 'solo' ? 'SOLO' : currentMode === 'practice' ? 'PRACTICE' : 'VERSUS', 100, 936);
+  ctx.fillText('MODE',   100, 976);
+  ctx.textAlign = 'right';
+  ctx.fillText('RISHI MADE THIS',  VW - 100, 936);
+  ctx.fillText('WWW.RISHI.DESIGN', VW - 100, 976);
+  ctx.restore();
+
+  /* ─ pause menu (settles down from above + fades in) ─ */
+  if (S.paused) {
+    const pauseTarget = pauseExiting ? 0 : 1;
+    pauseAnim += (pauseTarget - pauseAnim) * 0.2;
+    if (pauseExiting && pauseAnim < 0.03) { S.paused = false; pauseExiting = false; pauseAnim = 0; }
+    const a = pauseAnim;
+    ctx.fillStyle = 'rgba(0,0,0,' + (0.6 * a) + ')';
+    ctx.fillRect(0, 0, VW, VH);
+    ctx.save();
+    ctx.globalAlpha = a;
+    ctx.translate(0, (1 - a) * -40);   // start slightly above, settle to center
+    // panel
+    const boxW = 520, boxH = 380;
+    const bx = CX - boxW / 2, by = PLAY_MID - boxH / 2;
+    ctx.fillStyle = '#000';
+    ctx.fillRect(bx, by, boxW, boxH);
+    ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(bx, by, boxW, boxH);
+    // heading
+    const px = bx + 48;
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold italic 34px "Inter", monospace';
+    ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    ctx.fillText('PAUSED', px, by + 62);
+    // options: keycap + letter-spaced rest
+    const o0 = by + 150, og = 66;
+    drawPauseOption('R', 'ESTART',   px, o0);
+    drawPauseOption('Q', 'UIT',      px, o0 + og);
+    drawPauseOption('C', 'ONTINUE',  px, o0 + og * 2);
+    ctx.restore();
+  } else {
+    pauseAnim = 0;
+    pauseExiting = false;
+  }
+
+  /* ─ win screen (settles down from above + fades in, matching pause/main menu) ─ */
+  if (S.winner) {
+    winAnim += (1 - winAnim) * 0.2;
+    const a = winAnim;
+    ctx.fillStyle = 'rgba(0,0,0,' + (0.6 * a) + ')';
+    ctx.fillRect(0, 0, VW, VH);
+    ctx.save();
+    ctx.globalAlpha = a;
+    ctx.translate(0, (1 - a) * -40);   // start slightly above, settle to center
+    // panel
+    const boxW = 520, boxH = 320;
+    const bx = CX - boxW / 2, by = PLAY_MID - boxH / 2;
+    ctx.fillStyle = '#000';
+    ctx.fillRect(bx, by, boxW, boxH);
+    ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(bx, by, boxW, boxH);
+    // heading
+    const px = bx + 48;
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold italic 34px "Inter", monospace';
+    ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    const winnerLabel = S.winner === 'left' ? 'P1' : (currentMode === 'solo' ? 'CPU' : 'P2');
+    ctx.fillText(winnerLabel + ' WINS', px, by + 62);
+    // options: keycap + letter-spaced rest
+    const o0 = by + 150, og = 66;
+    drawPauseOption('R', 'EPLAY', px, o0);
+    drawPauseOption('Q', 'UIT',   px, o0 + og);
+    ctx.restore();
+  } else {
+    winAnim = 0;
+  }
+
+  /* ─ +100 popup — inner side of the scorer's paddle (opposite their score); not in practice ─ */
+  if (S.flash > FLASH_FRAMES - PLUS100_FRAMES && !S.winner && !practice) {
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold italic 75px "Inter", monospace';
+    ctx.textBaseline = 'middle';
+    if (S.flashSide === 'left') {
+      ctx.textAlign = 'left';
+      ctx.fillText('+100', LP_X + PW + 20, S.left.scoreY);
+    } else {
+      ctx.textAlign = 'right';
+      ctx.fillText('+100', RP_X - 20, S.right.scoreY);
+    }
+  }
+
+  /* ─ score flash: invert the whole screen on alternating phases ─ */
+  if (S.flash > 0) {
+    const phase = Math.floor((FLASH_FRAMES - S.flash) / FLASH_HALF);
+    if (phase % 2 === 0) {
+      ctx.globalCompositeOperation = 'difference';
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(0, 0, VW, VH);
+      ctx.globalCompositeOperation = 'source-over';
+    }
+  }
+
+  ctx.restore();
+}
+
+function drawChevron(cx, cy, dir, w = 7, h = 4) {
+  ctx.save();
+  ctx.lineWidth = 2.5;
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  if (dir === 'up') {
+    ctx.moveTo(cx - w, cy + h); ctx.lineTo(cx, cy - h); ctx.lineTo(cx + w, cy + h);
+  } else {
+    ctx.moveTo(cx - w, cy - h); ctx.lineTo(cx, cy + h); ctx.lineTo(cx + w, cy - h);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+/* rounded-rect path (for keycaps) */
+function roundRectPath(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y,     x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x,     y + h, r);
+  ctx.arcTo(x,     y + h, x,     y,     r);
+  ctx.arcTo(x,     y,     x + w, y,     r);
+  ctx.closePath();
+}
+
+/* a keycap: gray rounded box with a letter, centered on (cx, cy) */
+function drawKeycap(cx, cy, letter, s = 28) {
+  ctx.save();
+  ctx.fillStyle = KEYCAP_BG;
+  roundRectPath(cx - s/2, cy - s/2, s, s, 5);
+  ctx.fill();
+  ctx.fillStyle = KEYCAP_FG;
+  ctx.font = 'bold 16px "Inter", monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(letter, cx, cy + 1);
+  ctx.restore();
+}
+
+/* pause-menu option: [key]cap then the rest of the word, letter-spaced and dim */
+function drawPauseOption(key, rest, x, y) {
+  const cap = 32;
+  ctx.fillStyle = KEYCAP_BG;
+  roundRectPath(x, y - cap / 2, cap, cap, 5); ctx.fill();
+  ctx.fillStyle = KEYCAP_FG;
+  ctx.font = 'bold 20px "Inter", monospace';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(key, x + cap / 2, y + 1);
+  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  ctx.font = 'bold 24px "Inter", monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText(rest.split('').join(' '), x + cap + 14, y);
+}
+
+/* player-control row: dim label + key cap + up/down chevron, centered on x */
+function drawControlRow(x, y, label, key, dir) {
+  ctx.fillStyle = DIM;
+  ctx.strokeStyle = DIM;
+  ctx.font = 'bold italic 18px "Inter", monospace';
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(label, x - 24, y);
+  drawKeycap(x, y, key, 28);
+  drawChevron(x + 26, y, dir);
+}
+
+/* PONG wordmark: paddle bars framing P + ball(=O) / N + G */
+function drawTitleLogo(cx) {
+  const colDx = 17, barDx = 48;
+  ctx.save();
+  ctx.fillStyle = DIM;
+  ctx.strokeStyle = DIM;
+  // paddle bars on each side
+  ctx.lineWidth = 3; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(cx - barDx, HDR_R1 - 13); ctx.lineTo(cx - barDx, HDR_R2 + 13); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx + barDx, HDR_R1 - 13); ctx.lineTo(cx + barDx, HDR_R2 + 13); ctx.stroke();
+  // letters
+  ctx.font = 'bold 28px "Inter", monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('P', cx - colDx, HDR_R1);
+  ctx.fillText('N', cx - colDx, HDR_R2);
+  ctx.fillText('G', cx + colDx, HDR_R2);
+  // ball as the "O"
+  const bs = 13;
+  ctx.fillRect(cx + colDx - bs/2, HDR_R1 - bs/2, bs, bs);
+  ctx.restore();
+}
+
+/* stack rows of characters vertically down the center line; '/' draws a divider bar */
+function drawVerticalRows(rows, cx, midY, lh) {
+  ctx.save();
+  ctx.fillStyle = DIM;
+  ctx.strokeStyle = DIM;
+  ctx.font = 'bold 28px "Inter", monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  const startY = midY - (rows.length - 1) * lh / 2;
+  rows.forEach((r, i) => {
+    const y = startY + i * lh;
+    if (r === '/') {
+      ctx.lineWidth = 2.5;
+      ctx.beginPath(); ctx.moveTo(cx - 14, y); ctx.lineTo(cx + 14, y); ctx.stroke();
+    } else {
+      ctx.fillText(r, cx, y);
+    }
+  });
+  ctx.restore();
+}
+
+/* rows for the deuce / advantage / game-point indicator, or null when none */
+function centerLabelRows(label) {
+  if (label === 'deuce')       return ['D','E','U','C','E'];
+  if (label === 'adv-left')    return ['A','D','V','/','P','1'];
+  if (label === 'adv-right')   return ['A','D','V','/','P','2'];
+  if (label === 'gp-left' || label === 'gp-right') return ['G','A','M','E','/','P','T'];
+  return null;
+}
+
+/* footer row: trigger key as a keycap, followed by the rest of the word */
+function drawFooterRow(key, rest, cx, cy) {
+  const cap = 28, gap = 10;
+  ctx.font = 'bold 20px "Inter", monospace';
+  const restW = ctx.measureText(rest).width;
+  const totalW = cap + gap + restW;
+  const left = cx - totalW / 2;
+  drawKeycap(left + cap/2, cy, key, cap);
+  ctx.fillStyle = DIM;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(rest, left + cap + gap, cy);
+}
+
+/* a score shown as a fraction: score×100 over SCORE_TARGET, bold italic.
+   side 'left' anchors the block's right edge at x; 'right' anchors its left edge. */
+/* thin progress bar beside a paddle: dim track, white fill from the bottom */
+function drawScoreBar(px, py, fraction, side) {
+  const BW = 5, G = 6;
+  const bx = side === 'left' ? px - G - BW : px + PW + G;
+  ctx.fillStyle = 'rgba(255,255,255,0.25)';
+  ctx.fillRect(bx, py, BW, PH);
+  const fh = PH * Math.max(0, Math.min(1, fraction));
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(bx, py + PH - fh, BW, fh);
+}
+
+function drawScore(numVal, denVal, x, y, side) {
+  const num = String(numVal), den = String(denVal);
+  // room from the anchor to the screen edge — keep the numerator inside it
+  const EDGE = 16;
+  const avail = side === 'left' ? (x - EDGE) : (VW - EDGE - x);
+  // largest numerator size (up to 52) that still fits the available width
+  let numSize = 52;
+  ctx.font = 'bold italic ' + numSize + 'px "Inter", monospace';
+  let numW = ctx.measureText(num).width;
+  if (numW > avail) {
+    numSize = Math.max(22, Math.floor(numSize * avail / numW));
+    ctx.font = 'bold italic ' + numSize + 'px "Inter", monospace';
+    numW = ctx.measureText(num).width;
+  }
+  ctx.font = 'bold italic 26px "Inter", monospace';
+  const denW = ctx.measureText(den).width;
+  const blockW = Math.max(numW, denW);
+  const left = side === 'left' ? x - blockW : x;
+  ctx.fillStyle = '#fff';
+  ctx.textAlign = 'left';
+  // numerator (sits above the bar)
+  ctx.font = 'bold italic ' + numSize + 'px "Inter", monospace';
+  ctx.textBaseline = 'bottom';
+  ctx.fillText(num, left, y - 6);
+  // fraction bar
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(left + blockW, y); ctx.stroke();
+  // denominator (sits below the bar)
+  ctx.font = 'bold italic 26px "Inter", monospace';
+  ctx.textBaseline = 'top';
+  ctx.fillText(den, left, y + 6);
+}
+
+function drawBall(x, y, sx, sy, alpha) {
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.shadowColor = 'rgba(255,255,255,0.85)';
+  ctx.shadowBlur  = 28;
+  ctx.fillStyle   = '#fff';
+  ctx.translate(x, y);
+  ctx.scale(sx, sy);
+  ctx.fillRect(-BS/2, -BS/2, BS, BS);
+  ctx.restore();
+}
+
+function drawPaddle(p, px, side) {
+  const cy = p.y + PH/2;
+  /* length never changes; width narrows from movement (stretchY) + a transient
+     impact pop on ball contact */
+  const impact = p.squishT > 0 ? Math.sin((p.squishT / 8) * Math.PI) : 0;
+  const narrow = (p.stretchY - 1) + impact * 0.2;
+  const sx = 1 - narrow * 0.6;
+  ctx.save();
+  ctx.translate(px + PW/2 + p.recoil, cy);   // recoil knocks the paddle outward
+  ctx.scale(sx, 1);
+  ctx.shadowColor = 'rgba(255,255,255,0.65)';
+  ctx.shadowBlur  = 12;
+  ctx.fillStyle   = '#fff';
+  ctx.fillRect(-PW/2, -PH/2, PW, PH);
+  ctx.restore();
+}
+
+/* ─── CRT post-process (WebGL) ─────────────────────────────────── */
+function initGL(cv) {
+  let g = null;
+  try { g = cv.getContext('webgl', { antialias: false, alpha: false, preserveDrawingBuffer: false }); } catch (_) {}
+  if (!g) return null;
+
+  const vs = `
+    attribute vec2 aPos;
+    varying vec2 vUv;
+    void main() { vUv = aPos * 0.5 + 0.5; gl_Position = vec4(aPos, 0.0, 1.0); }`;
+
+  const fs = `
+    precision mediump float;
+    varying vec2 vUv;
+    uniform sampler2D uTex;
+    uniform vec2 uRes;
+    uniform float uRoll;            // rolling hum-bar position (0..1, drifts over time)
+    uniform float uFlicker;         // global brightness multiplier (CRT flicker)
+    const float CURVE = 0.26;       // barrel / fisheye strength
+    const float OVERSCAN = 1.06;    // >1 zooms out so curved edges stay in view (nothing cropped)
+    const float CA = 0.0026;        // chromatic aberration (radial)
+    const float SCAN_DEPTH = 0.30;  // scanline darkness
+    const float BAND_WIDTH = 0.16;  // half-height of the hum bar (fraction of screen)
+    const float BAND_STRENGTH = 0.12; // how much the hum bar brightens
+    vec2 barrel(vec2 uv) {
+      vec2 c = (uv - 0.5) * OVERSCAN;
+      float r2 = dot(c, c);
+      return 0.5 + c * (1.0 + CURVE * r2);
+    }
+    void main() {
+      vec2 uv = barrel(vUv);
+      // outside the curved tube -> black bezel
+      if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+        gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return;
+      }
+      vec2 dir = uv - 0.5;
+      float r = texture2D(uTex, uv + dir * CA).r;
+      float g = texture2D(uTex, uv).g;
+      float b = texture2D(uTex, uv - dir * CA).b;
+      vec3 col = vec3(r, g, b);
+      // static scanlines, following the curve
+      float sl = 0.5 + 0.5 * sin(uv.y * uRes.y * 1.6);
+      col *= 1.0 - SCAN_DEPTH * sl;
+      // rolling hum bar: a soft wide band that drifts slowly up the screen
+      float d = abs(fract(uv.y - uRoll + 0.5) - 0.5);
+      float band = smoothstep(BAND_WIDTH, 0.0, d);
+      col *= 1.0 + band * BAND_STRENGTH;
+      // gentle vignette toward the edges
+      col *= 1.0 - dot(dir, dir) * 0.40;
+      // global CRT flicker over everything
+      col *= uFlicker;
+      gl_FragColor = vec4(col, 1.0);
+    }`;
+
+  function sh(type, src) {
+    const s = g.createShader(type);
+    g.shaderSource(s, src); g.compileShader(s);
+    if (!g.getShaderParameter(s, g.COMPILE_STATUS)) console.error(g.getShaderInfoLog(s));
+    return s;
+  }
+  const prog = g.createProgram();
+  g.attachShader(prog, sh(g.VERTEX_SHADER, vs));
+  g.attachShader(prog, sh(g.FRAGMENT_SHADER, fs));
+  g.linkProgram(prog);
+  g.useProgram(prog);
+
+  const buf = g.createBuffer();
+  g.bindBuffer(g.ARRAY_BUFFER, buf);
+  g.bufferData(g.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, -1,1, 1,-1, 1,1]), g.STATIC_DRAW);
+  const aPos = g.getAttribLocation(prog, 'aPos');
+  g.enableVertexAttribArray(aPos);
+  g.vertexAttribPointer(aPos, 2, g.FLOAT, false, 0, 0);
+
+  const tex = g.createTexture();
+  g.bindTexture(g.TEXTURE_2D, tex);
+  g.texParameteri(g.TEXTURE_2D, g.TEXTURE_WRAP_S, g.CLAMP_TO_EDGE);
+  g.texParameteri(g.TEXTURE_2D, g.TEXTURE_WRAP_T, g.CLAMP_TO_EDGE);
+  g.texParameteri(g.TEXTURE_2D, g.TEXTURE_MIN_FILTER, g.LINEAR);
+  g.texParameteri(g.TEXTURE_2D, g.TEXTURE_MAG_FILTER, g.LINEAR);
+  g.pixelStorei(g.UNPACK_FLIP_Y_WEBGL, true);
+
+  glProg = prog; glTex = tex;
+  glURes = g.getUniformLocation(prog, 'uRes');
+  glURoll = g.getUniformLocation(prog, 'uRoll');
+  glUFlicker = g.getUniformLocation(prog, 'uFlicker');
+  g.uniform1i(g.getUniformLocation(prog, 'uTex'), 0);
+  return g;
+}
+
+function present() {
+  if (!gl) return;
+  gl.viewport(0, 0, view.width, view.height);
+  gl.bindTexture(gl.TEXTURE_2D, glTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, canvas);
+  gl.uniform2f(glURes, view.width, view.height);
+  gl.uniform1f(glURoll, 1.0 - (performance.now() * 0.001 / ROLL_PERIOD) % 1.0);  // drift upward
+  gl.uniform1f(glUFlicker, 1.0 - FLICKER_AMOUNT * Math.random());
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+}
+
+/* ─── mobile block screen (desktop-only experience) ───────────────── */
+function drawMobileBlock() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.save();
+  ctx.scale(scale, scale);
+
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, VW, VH);
+
+  const boxW = 560, boxH = 320;
+  const bx = CX - boxW / 2, by = PLAY_MID - boxH / 2;
+  ctx.fillStyle = '#000';
+  ctx.fillRect(bx, by, boxW, boxH);
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(bx, by, boxW, boxH);
+
+  const px = bx + 48;
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold italic 34px "Inter", monospace';
+  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  ctx.fillText('UH-OH!', px, by + 62);
+
+  ctx.fillStyle = 'rgba(255,255,255,0.7)';
+  ctx.font = 'bold italic 19px "Inter", monospace';
+  const body = "LOOKS LIKE YOU'RE ON A MOBILE DEVICE. THIS IS A DESKTOP-ONLY EXPERIENCE FOR NOW. TRY OPENING THE PAGE ON YOUR COMPUTER INSTEAD.";
+  const lines = wrapText(body, boxW - 96);
+  lines.forEach((line, i) => ctx.fillText(line, px, by + 130 + i * 30));
+
+  ctx.restore();
+}
+
+/* greedy word-wrap using the current ctx font; returns an array of lines */
+function wrapText(text, maxWidth) {
+  const words = text.split(' ');
+  const lines = [];
+  let line = '';
+  words.forEach(w => {
+    const test = line ? line + ' ' + w : w;
+    if (ctx.measureText(test).width > maxWidth && line) { lines.push(line); line = w; }
+    else line = test;
+  });
+  if (line) lines.push(line);
+  return lines;
+}
+
+/* ─── main menu screen ─────────────────────────────────────────── */
+function drawMenu() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.save();
+  ctx.scale(scale, scale);
+
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, VW, VH);
+
+  // court lines + resting paddles
+  ctx.strokeStyle = 'rgba(255,255,255,0.14)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(LX, PLAY_TOP); ctx.lineTo(LX, PLAY_BOTTOM); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(RX, PLAY_TOP); ctx.lineTo(RX, PLAY_BOTTOM); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(CX, PLAY_TOP); ctx.lineTo(CX, PLAY_BOTTOM); ctx.stroke();
+  drawPaddle(S.left,  LP_X, 'left');
+  drawPaddle(S.right, RP_X, 'right');
+
+  // title
+  ctx.fillStyle = DIM; ctx.strokeStyle = DIM;
+  drawTitleLogo(CX);
+
+  // exit transition: on select, the panel slides up and fades out, then either the game
+  // starts, the difficulty panel swaps in (solo), or the mode panel swaps back in (back)
+  if (menuExiting) {
+    menuExit += 0.07;
+    if (menuExit >= 1) {
+      menuExiting = false;
+      if (pendingAdvance) {
+        pendingAdvance = false; menuStage = 'difficulty'; menuSelY = null;
+        menuEntering = true; menuExit = 1;
+      } else if (pendingBack) {
+        pendingBack = false; menuStage = 'mode'; menuSelY = null;
+        menuEntering = true; menuExit = 1;
+      } else {
+        menuExit = 0; startGame(pendingMode); ctx.restore(); return;
+      }
+    }
+  }
+  if (menuEntering) {
+    menuExit += (0 - menuExit) * 0.18;
+    if (menuExit < 0.02) { menuExit = 0; menuEntering = false; }
+  }
+  ctx.save();
+  ctx.globalAlpha = 1 - menuExit;
+  ctx.translate(0, -menuExit * menuExit * 90);   // accelerate upward
+
+  const difficulty = menuStage === 'difficulty';
+  const list = difficulty ? DIFFICULTIES : MODES;
+  const selIndex = difficulty ? diffIndex : menuIndex;
+
+  // menu panel (opaque, covers the sim behind it)
+  const boxW = 520, boxH = 400;
+  const bx = CX - boxW / 2, by = PLAY_MID - boxH / 2;
+  ctx.fillStyle = '#000';
+  ctx.fillRect(bx, by, boxW, boxH);
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(bx, by, boxW, boxH);
+
+  // options block vertically centered in the panel (equal top/bottom padding)
+  const pad = 46, textX = bx + pad + 32, optGap = 118;
+  const lastLines = list[list.length - 1].desc.length;
+  const blockSpan = (list.length - 1) * optGap + 36 + (lastLines - 1) * 30;
+  const startY = by + (boxH - blockSpan) / 2;
+
+  // smooth-sliding selector bullet
+  const targetSelY = startY + selIndex * optGap;
+  if (menuSelY === null) menuSelY = targetSelY;
+  menuSelY += (targetSelY - menuSelY) * 0.25;
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(bx + pad, menuSelY - 8, 16, 16);
+
+  list.forEach((m, i) => {
+    const oy = startY + i * optGap;
+    const sel = i === selIndex;
+    ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold italic 34px "Inter", monospace';
+    ctx.fillText(m.title, textX, oy);
+    ctx.fillStyle = sel ? '#fff' : 'rgba(255,255,255,0.42)';
+    ctx.font = 'bold italic 23px "Inter", monospace';
+    m.desc.forEach((line, li) => ctx.fillText(line, textX, oy + 36 + li * 30));
+  });
+
+  // footer
+  drawMenuFooterRow([{ cap: 'ENTER' }, { text: 'TO CONFIRM' }], 936);
+  if (difficulty) {
+    drawMenuFooterRow([{ cap: 'W' }, { cap: 'S' }, { text: 'NAVIGATE' }, { cap: 'Q' }, { text: 'BACK' }], 976);
+  } else {
+    drawMenuFooterRow([{ cap: 'W' }, { cap: 'S' }, { text: 'OR ARROW KEYS TO NAVIGATE' }], 976);
+  }
+
+  ctx.restore();   // end exit-transition wrapper
+  ctx.restore();
+}
+
+/* a centered footer row of keycaps + dim text */
+function drawMenuFooterRow(items, cy) {
+  const capH = 32, gap = 12, capPad = 10;
+  const capFont = 'bold 18px "Inter", monospace';
+  const txtFont = 'bold italic 22px "Inter", monospace';
+  const widths = items.map(it => {
+    if (it.cap) { ctx.font = capFont; return ctx.measureText(it.cap).width + capPad * 2; }
+    ctx.font = txtFont; return ctx.measureText(it.text).width;
+  });
+  const total = widths.reduce((a, b) => a + b, 0) + gap * (items.length - 1);
+  let x = VW / 2 - total / 2;
+  ctx.textBaseline = 'middle';
+  items.forEach((it, i) => {
+    const w = widths[i];
+    if (it.cap) {
+      ctx.fillStyle = KEYCAP_BG;
+      roundRectPath(x, cy - capH / 2, w, capH, 5); ctx.fill();
+      ctx.fillStyle = KEYCAP_FG;
+      ctx.font = capFont; ctx.textAlign = 'center';
+      ctx.fillText(it.cap, x + w / 2, cy + 1);
+    } else {
+      ctx.fillStyle = 'rgba(255,255,255,0.42)';
+      ctx.font = txtFont; ctx.textAlign = 'left';
+      ctx.fillText(it.text, x, cy);
+    }
+    x += w + gap;
+  });
+}
+
+/* ─── loop ────────────────────────────────────────────────────── */
+function loop() {
+  if (isMobile) {
+    drawMobileBlock();
+    present();
+    requestAnimationFrame(loop);
+    return;
+  }
+  if (screen === 'menu') {
+    drawMenu();
+  } else {
+    update();
+    draw();
+  }
+  // quit-to-menu: fade to black, switch to the menu at the midpoint, fade back in
+  if (quitting) {
+    quitT += 0.04;
+    if (quitT >= 0.5 && !quitSwitched) { quitToMenu(); quitSwitched = true; }
+    if (quitT >= 1) quitting = false;
+    const a = Math.max(0, 1 - Math.abs(quitT - 0.5) * 2);
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = 'rgba(0,0,0,' + a + ')';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.restore();
+  }
+  present();
+  requestAnimationFrame(loop);
+}
+
+init();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
